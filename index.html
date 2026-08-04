@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#111111">
+<title>kakeibo</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #111; color: #fff; font-family: sans-serif; overflow: hidden; }
+  #video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #shutter {
+    position: fixed; bottom: max(28px, env(safe-area-inset-bottom)); left: 50%;
+    transform: translateX(-50%);
+    width: 84px; height: 84px; border-radius: 50%;
+    border: 5px solid #fff; background: rgba(255,255,255,.25);
+    -webkit-tap-highlight-color: transparent;
+  }
+  #shutter:active { background: rgba(255,255,255,.6); }
+  #status {
+    position: fixed; top: max(16px, env(safe-area-inset-top)); left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 18px; border-radius: 20px; font-size: 15px;
+    background: rgba(0,0,0,.65); white-space: nowrap;
+    transition: background .3s;
+  }
+  #status.ok { background: rgba(22,140,60,.85); }
+  #status.err { background: rgba(190,40,40,.9); }
+  #status.hidden { display: none; }
+</style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status" class="hidden"></div>
+  <button id="shutter" aria-label="撮影"></button>
+  <canvas id="canvas" hidden></canvas>
+  <script src="app.js"></script>
+</body>
+</html>
