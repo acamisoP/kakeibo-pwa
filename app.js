@@ -11,7 +11,7 @@ const GAS_URL = (() => {
 const MAX_EDGE = 2560;
 const TIMEOUT_MS = 60000;
 const GENRES = ['食費', '嗜好品', 'タバコ', '外食費', '防衛費', '車両費', '交通費', '旅費', '日用品', '医療・健康', 'サブスク(固定費)', '仕事(経費)', 'その他', '給与', '副収入'];
-const PAYMENTS = ['楽天ペイ', 'Sonyデビット', '現金', 'その他'];
+const PAYMENTS = ['楽天ペイ', 'Sonyデビット', 'PayPay', 'd払い', 'dポイント', 'PayPal', '現金', 'その他'];
 const STORE_TYPES = ['スーパー', 'コンビニ', 'EC', '実店舗その他'];
 
 const $ = id => document.getElementById(id);
