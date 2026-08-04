@@ -38,10 +38,11 @@ function startTimer(prefix) {
 }
 function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
 
-// ---------- 起動: 接続チェック + 即カメラ ----------
+// ---------- 起動: 今月サマリー取得(接続チェック兼用) + 即カメラ ----------
 (async function init() {
   if (!GAS_URL) {
-    $('conn').textContent = '未設定: ?gas=<WebアプリURL> 付きリンクで一度開いてください';
+    $('summary-amount').textContent = '未設定';
+    $('summary-sub').textContent = '?gas=<WebアプリURL> 付きリンクで一度開いてください';
     $('conn').className = 'err';
     return;
   }
@@ -50,13 +51,19 @@ function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } 
 
   try {
     const c = new AbortController();
-    setTimeout(() => c.abort(), 10000);
-    const r = await fetch(GAS_URL, { method: 'GET', signal: c.signal, redirect: 'follow' });
+    setTimeout(() => c.abort(), 15000);
+    const r = await fetch(GAS_URL + '?summary=1', { method: 'GET', signal: c.signal, redirect: 'follow' });
     const j = await r.json();
-    if (j.ok) { $('conn').textContent = '✓ サーバー接続OK'; $('conn').className = 'ok'; }
-    else throw new Error('unexpected');
+    if (j.ok) {
+      $('summary-amount').textContent = '¥' + Number(j.total || 0).toLocaleString('ja-JP');
+      $('summary-sub').textContent = j.month + '月 / ' + j.count + '件の取引';
+      $('conn').textContent = '✓ サーバー接続OK';
+      $('conn').className = 'ok';
+    } else throw new Error(j.error || 'unexpected');
   } catch (e) {
-    $('conn').textContent = '✗ サーバーに届きません(' + (e.name === 'AbortError' ? '10秒無応答' : e) + ')\nBraveはシールドOFF、またはChromeで開いてください';
+    $('summary-amount').textContent = '—';
+    $('summary-sub').textContent = 'サマリー取得失敗';
+    $('conn').textContent = '✗ サーバーに届きません(' + (e.name === 'AbortError' ? '15秒無応答' : e) + ')。BraveはシールドOFF、またはChromeで';
     $('conn').className = 'err';
   }
 })();
