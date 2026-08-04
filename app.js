@@ -121,6 +121,32 @@ async function sendOcr(payload) {
 }
 
 // ---------- 編集画面 ----------
+/** ブランドカラー背景+ロゴ(faviconベストエフォート)。不明時は素通し */
+function applyBrand(r) {
+  const brand = $('brand');
+  const logo = $('brand-logo');
+  const name = $('brand-name');
+  const color = /^#[0-9a-fA-F]{6}$/.test(r.brand_color || '') ? r.brand_color : null;
+
+  document.body.style.background = color
+    ? `linear-gradient(180deg, ${color}55 0%, #111 45%)`
+    : '#111';
+
+  if (color || r.brand_domain) {
+    brand.style.display = 'flex';
+    name.textContent = r.store || '';
+    if (r.brand_domain) {
+      logo.style.display = '';
+      logo.onerror = () => { logo.style.display = 'none'; };
+      logo.src = 'https://www.google.com/s2/favicons?sz=128&domain=' + encodeURIComponent(r.brand_domain);
+    } else {
+      logo.style.display = 'none';
+    }
+  } else {
+    brand.style.display = 'none';
+  }
+}
+
 function fillSelect(sel, options, value) {
   sel.innerHTML = '';
   options.forEach(o => {
@@ -132,6 +158,7 @@ function fillSelect(sel, options, value) {
 }
 
 function renderEdit(r) {
+  applyBrand(r);
   $('f-store').value = r.store || '';
   $('f-date').value = r.date || new Date().toISOString().slice(0, 10);
   $('f-total').value = r.total || 0;
@@ -199,12 +226,18 @@ $('ok').addEventListener('click', () => {
     fetch(GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body, keepalive: true }).catch(() => {});
   }
   if (navigator.vibrate) navigator.vibrate(80);
-  window.close(); // PWA/タブによっては閉じられないため、閉じられない場合は待機画面へ
-  setTimeout(() => { show('idle'); $('conn').textContent = '✅ 登録を送信しました(閉じてOK)'; $('conn').className = 'ok'; }, 300);
+  window.close(); // ホーム画面から起動したPWAなら閉じられる。タブの場合は完了表示へ
+  setTimeout(() => {
+    document.body.style.background = '#111';
+    show('idle');
+    $('conn').textContent = '✅ 登録を送信しました(閉じてOK)';
+    $('conn').className = 'ok';
+  }, 300);
 });
 
 $('cancel').addEventListener('click', () => {
   ocrResult = null;
+  document.body.style.background = '#111';
   show('idle');
 });
 
