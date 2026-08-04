@@ -1,5 +1,4 @@
-// GAS WebアプリURLはリポジトリに含めない(Publicリポジトリのため)。
-// 初回に「https://<pages>/?gas=<WebアプリURL>」を開くと localStorage に保存され、以後は不要。
+// GAS WebアプリURLはリポジトリに含めない。初回のみ ?gas=<URL> で開くと localStorage に保存される。
 const GAS_URL = (() => {
   const fromQuery = new URLSearchParams(location.search).get('gas');
   if (fromQuery) {
@@ -9,110 +8,207 @@ const GAS_URL = (() => {
   return localStorage.getItem('kakeibo_gas_url') || '';
 })();
 
-const MAX_EDGE = 2560;       // 送信画像の長辺(OCRに十分・通信量を抑える)
-const TIMEOUT_MS = 90000;    // これを超えたら明示的にエラー表示する
+const MAX_EDGE = 2560;
+const TIMEOUT_MS = 60000;
+const GENRES = ['食費', '嗜好品', 'タバコ', '外食費', '防衛費', '車両費', '交通費', '旅費', '日用品', '医療・健康', 'サブスク(固定費)', '仕事(経費)', 'その他', '給与', '副収入'];
+const PAYMENTS = ['楽天ペイ', 'Sonyデビット', '現金', 'その他'];
+const STORE_TYPES = ['スーパー', 'コンビニ', 'EC', '実店舗その他'];
 
-const fileInput = document.getElementById('file');
-const shootBtn = document.getElementById('shoot');
-const retryBtn = document.getElementById('retry');
-const statusEl = document.getElementById('status');
-const thumbEl = document.getElementById('thumb');
-
-let lastPayload = null;  // 再送信用
+const $ = id => document.getElementById(id);
+const screens = { idle: $('scr-idle'), busy: $('scr-busy'), edit: $('scr-edit') };
+let ocrResult = null;   // {receipt, imageUrl}
+let lastPayload = null; // 再送信用
 let timerId = null;
 
-function setStatus(text, cls) {
-  statusEl.textContent = text;
-  statusEl.className = cls || '';
+function show(name) {
+  Object.values(screens).forEach(s => s.classList.remove('active'));
+  screens[name].classList.add('active');
 }
 
-function startElapsedTimer(prefix) {
+function setBusy(text, cls) {
+  $('busy-status').textContent = text;
+  $('busy-status').className = cls || '';
+}
+
+function startTimer(prefix) {
   const t0 = Date.now();
-  stopElapsedTimer();
-  timerId = setInterval(() => {
-    setStatus(prefix + '\n' + Math.round((Date.now() - t0) / 1000) + '秒経過');
-  }, 1000);
+  stopTimer();
+  timerId = setInterval(() =>
+    setBusy(prefix + '\n' + Math.round((Date.now() - t0) / 1000) + '秒経過'), 1000);
 }
+function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } }
 
-function stopElapsedTimer() {
-  if (timerId) { clearInterval(timerId); timerId = null; }
-}
-
-shootBtn.addEventListener('click', () => {
+// ---------- 起動: 接続チェック + 即カメラ ----------
+(async function init() {
   if (!GAS_URL) {
-    setStatus('未設定: ?gas=<WebアプリURL> 付きのリンクで一度開いてください', 'err');
+    $('conn').textContent = '未設定: ?gas=<WebアプリURL> 付きリンクで一度開いてください';
+    $('conn').className = 'err';
     return;
   }
-  fileInput.click(); // 標準カメラアプリが開く(フォーカス・ライト・ズーム自由)
-});
-
-retryBtn.addEventListener('click', () => {
-  if (lastPayload) send(lastPayload);
-});
-
-fileInput.addEventListener('change', async () => {
-  const file = fileInput.files && fileInput.files[0];
-  fileInput.value = ''; // 同じ写真の再選択でもchangeが発火するように
-  if (!file) return;
+  // 自動でカメラを開く(ブラウザがユーザー操作を要求する場合はタップ待ち)
+  $('file').click();
 
   try {
-    setStatus('画像を処理中…');
-    const { base64, previewUrl } = await resizeToJpeg(file, MAX_EDGE);
-    thumbEl.src = previewUrl;
-    thumbEl.style.display = 'block';
-    lastPayload = JSON.stringify({ image: base64, mime: 'image/jpeg', filename: 'receipt' });
-    await send(lastPayload);
+    const c = new AbortController();
+    setTimeout(() => c.abort(), 10000);
+    const r = await fetch(GAS_URL, { method: 'GET', signal: c.signal, redirect: 'follow' });
+    const j = await r.json();
+    if (j.ok) { $('conn').textContent = '✓ サーバー接続OK'; $('conn').className = 'ok'; }
+    else throw new Error('unexpected');
   } catch (e) {
-    setStatus('画像処理に失敗: ' + e, 'err');
+    $('conn').textContent = '✗ サーバーに届きません(' + (e.name === 'AbortError' ? '10秒無応答' : e) + ')\nBraveはシールドOFF、またはChromeで開いてください';
+    $('conn').className = 'err';
+  }
+})();
+
+// 待機画面のどこをタップしてもカメラ起動
+screens.idle.addEventListener('click', () => { if (GAS_URL) $('file').click(); });
+$('reshoot').addEventListener('click', () => $('file').click());
+$('retry').addEventListener('click', () => { if (lastPayload) sendOcr(lastPayload); });
+
+// ---------- 撮影 → リサイズ → OCR ----------
+$('file').addEventListener('change', async () => {
+  const file = $('file').files && $('file').files[0];
+  $('file').value = '';
+  if (!file) return;
+  show('busy');
+  $('retry').hidden = true; $('reshoot').hidden = true;
+  try {
+    setBusy('画像を圧縮中…');
+    const { base64, previewUrl } = await resizeToJpeg(file, MAX_EDGE);
+    $('thumb').src = previewUrl;
+    lastPayload = JSON.stringify({ image: base64, mime: 'image/jpeg' });
+    await sendOcr(lastPayload);
+  } catch (e) {
+    setBusy('画像処理に失敗: ' + e, 'err');
+    $('reshoot').hidden = false;
   }
 });
 
-async function send(payload) {
-  retryBtn.hidden = true;
-  shootBtn.hidden = true;
-  startElapsedTimer('送信中…(AI読取に10〜30秒かかります)');
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
+async function sendOcr(payload) {
+  show('busy');
+  $('retry').hidden = true; $('reshoot').hidden = true;
+  startTimer('AI読取中…(10〜20秒)');
+  const c = new AbortController();
+  const to = setTimeout(() => c.abort(), TIMEOUT_MS);
   try {
     const res = await fetch(GAS_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // CORSプリフライト回避
-      body: payload,
-      signal: controller.signal,
-      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: payload, signal: c.signal, redirect: 'follow',
     });
     const json = await res.json();
-    stopElapsedTimer();
-
-    if (json.ok && !json.needsReview) {
-      const detail = (json.store ? json.store : '') + (json.total ? ' ¥' + json.total : '') +
-        (json.items != null ? '\n明細 ' + json.items + '件' : '');
-      setStatus('✅ 登録完了\n' + detail + '\n閉じてOK', 'ok');
-      if (navigator.vibrate) navigator.vibrate(80);
+    stopTimer();
+    if (json.ok && json.receipt) {
+      ocrResult = json;
+      renderEdit(json.receipt);
+      show('edit');
+      if (navigator.vibrate) navigator.vibrate(50);
     } else if (json.ok && json.needsReview) {
-      setStatus('⚠️ 読取に失敗したため画像のみ登録しました\nNotionの【要確認】を後で修正してください', 'ok');
+      setBusy('⚠️ AI読取失敗。画像だけNotionに登録済み\n(【要確認】ページを後で修正してください)');
+      $('reshoot').hidden = false;
     } else {
       throw new Error(json.error || '不明なエラー');
     }
-    shootBtn.textContent = '📷 次のレシートを撮影';
-    shootBtn.hidden = false;
   } catch (e) {
-    stopElapsedTimer();
-    const msg = (e.name === 'AbortError')
-      ? '90秒応答がありません。電波の良い場所で「再送信」を押してください'
-      : String(e) + '\n(Braveの場合はシールドをOFFにするか、Chromeをお試しください)';
-    setStatus('❌ 送信失敗\n' + msg, 'err');
-    retryBtn.hidden = false;
-    shootBtn.textContent = '📷 撮り直す';
-    shootBtn.hidden = false;
-  } finally {
-    clearTimeout(timeout);
-  }
+    stopTimer();
+    setBusy('❌ 送信失敗\n' + (e.name === 'AbortError'
+      ? '60秒応答なし。電波の良い場所で再送信してください'
+      : String(e)), 'err');
+    $('retry').hidden = false;
+    $('reshoot').hidden = false;
+  } finally { clearTimeout(to); }
 }
 
-/** 長辺maxEdgeにリサイズしてJPEG base64を返す(EXIF回転はブラウザが補正) */
+// ---------- 編集画面 ----------
+function fillSelect(sel, options, value) {
+  sel.innerHTML = '';
+  options.forEach(o => {
+    const el = document.createElement('option');
+    el.textContent = o;
+    if (o === value) el.selected = true;
+    sel.appendChild(el);
+  });
+}
+
+function renderEdit(r) {
+  $('f-store').value = r.store || '';
+  $('f-date').value = r.date || new Date().toISOString().slice(0, 10);
+  $('f-total').value = r.total || 0;
+  fillSelect($('f-payment'), PAYMENTS, r.payment === '不明' ? 'その他' : r.payment);
+  fillSelect($('f-storetype'), STORE_TYPES, r.store_type);
+  $('f-kind').value = r.kind || '支出';
+
+  const wrap = $('items');
+  wrap.innerHTML = '';
+  (r.items || []).forEach(it => {
+    const div = document.createElement('div');
+    div.className = 'item';
+    const name = document.createElement('input');
+    name.value = it.normalized_name || it.raw_name || '';
+    name.dataset.raw = it.raw_name || '';
+    const r2 = document.createElement('div');
+    r2.className = 'r2';
+    const price = document.createElement('input');
+    price.type = 'number'; price.inputMode = 'numeric'; price.value = it.price || 0;
+    const genre = document.createElement('select');
+    fillSelect(genre, GENRES, it.genre);
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '✕';
+    del.onclick = () => div.remove();
+    r2.append(price, genre, del);
+    div.append(name, r2);
+    div.dataset.qty = it.quantity || 1;
+    wrap.appendChild(div);
+  });
+}
+
+function collectReceipt() {
+  const items = [...$('items').children].map(div => {
+    const [name] = div.getElementsByTagName('input');
+    const price = div.querySelector('input[type=number]');
+    const genre = div.querySelector('select');
+    return {
+      raw_name: name.dataset.raw || name.value,
+      normalized_name: name.value,
+      price: Number(price.value) || 0,
+      quantity: Number(div.dataset.qty) || 1,
+      genre: genre.value,
+    };
+  });
+  return {
+    kind: $('f-kind').value,
+    store: $('f-store').value || '不明',
+    store_type: $('f-storetype').value,
+    date: $('f-date').value,
+    total: Number($('f-total').value) || 0,
+    payment: $('f-payment').value,
+    items: items,
+  };
+}
+
+// OK: sendBeaconで登録を送信(ページを閉じても送信が完了する)→ 即クローズ
+$('ok').addEventListener('click', () => {
+  const body = JSON.stringify({
+    mode: 'commit',
+    receipt: collectReceipt(),
+    imageUrl: ocrResult && ocrResult.imageUrl,
+  });
+  const sent = navigator.sendBeacon(GAS_URL, new Blob([body], { type: 'text/plain;charset=utf-8' }));
+  if (!sent) { // beacon不可なら通常fetch(待たずに閉じる)
+    fetch(GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body, keepalive: true }).catch(() => {});
+  }
+  if (navigator.vibrate) navigator.vibrate(80);
+  window.close(); // PWA/タブによっては閉じられないため、閉じられない場合は待機画面へ
+  setTimeout(() => { show('idle'); $('conn').textContent = '✅ 登録を送信しました(閉じてOK)'; $('conn').className = 'ok'; }, 300);
+});
+
+$('cancel').addEventListener('click', () => {
+  ocrResult = null;
+  show('idle');
+});
+
+// ---------- 画像リサイズ ----------
 async function resizeToJpeg(file, maxEdge) {
   const bitmap = await createImageBitmap(file).catch(() => null);
   const img = bitmap || await loadImage(file);

@@ -9,43 +9,77 @@
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { height: 100%; background: #111; color: #fff; font-family: sans-serif; }
-  #app {
-    height: 100%; display: flex; flex-direction: column; align-items: center;
-    justify-content: center; gap: 24px; padding: 24px;
-    padding-top: max(24px, env(safe-area-inset-top));
-    padding-bottom: max(24px, env(safe-area-inset-bottom));
-    text-align: center;
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: sans-serif; }
+  html, body { height: 100%; background: #111; color: #fff; }
+  .screen { display: none; min-height: 100%; padding: 16px;
+    padding-top: max(16px, env(safe-area-inset-top));
+    padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+  .screen.active { display: flex; flex-direction: column; }
+  #scr-idle { align-items: center; justify-content: center; text-align: center; gap: 18px; }
+  #scr-idle .big { font-size: 26px; font-weight: bold; }
+  #conn { font-size: 13px; color: #888; }
+  #conn.ok { color: #4ade80; } #conn.err { color: #f87171; }
+  #scr-busy { align-items: center; justify-content: center; text-align: center; gap: 18px; }
+  #thumb { max-width: 60vw; max-height: 32vh; border-radius: 10px; border: 2px solid #333; }
+  #busy-status { font-size: 19px; line-height: 1.6; white-space: pre-line; }
+  #busy-status.err { color: #f87171; font-size: 15px; }
+  /* 編集画面 */
+  #scr-edit { gap: 10px; }
+  .row { display: flex; gap: 8px; }
+  input, select {
+    background: #1e1e1e; color: #fff; border: 1px solid #3a3a3a; border-radius: 8px;
+    padding: 12px 10px; font-size: 16px; width: 100%;
   }
-  #thumb {
-    max-width: 70vw; max-height: 40vh; border-radius: 12px;
-    border: 2px solid #333; display: none; object-fit: contain;
-  }
-  #status { font-size: 20px; line-height: 1.6; white-space: pre-line; }
-  #status.ok { color: #4ade80; }
-  #status.err { color: #f87171; font-size: 16px; }
-  .btn {
-    font-size: 22px; font-weight: bold; color: #fff;
-    background: #2ea44f; border: none; border-radius: 16px;
-    padding: 22px 40px; width: 100%; max-width: 420px;
-    -webkit-tap-highlight-color: transparent;
-  }
+  input[type=number] { text-align: right; }
+  label { font-size: 12px; color: #999; display: block; margin-bottom: 3px; }
+  .head-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  #items { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+  .item { background: #191919; border: 1px solid #2c2c2c; border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .item .r2 { display: grid; grid-template-columns: 90px 1fr 44px; gap: 6px; }
+  .del { background: #3a1d1d; color: #f87171; border: none; border-radius: 8px; font-size: 18px; }
+  .btn { font-size: 20px; font-weight: bold; color: #fff; background: #2ea44f;
+    border: none; border-radius: 14px; padding: 18px; width: 100%;
+    -webkit-tap-highlight-color: transparent; }
   .btn:active { filter: brightness(1.2); }
   .btn.secondary { background: #444; }
-  .btn[hidden] { display: none; }
-  #hint { color: #888; font-size: 13px; }
+  #ok-bar { position: sticky; bottom: 0; padding: 10px 0 4px; background: linear-gradient(transparent, #111 30%); display: flex; gap: 8px; }
+  h2 { font-size: 15px; color: #aaa; margin: 6px 0 2px; }
 </style>
 </head>
 <body>
-  <div id="app">
-    <img id="thumb" alt="撮影したレシート">
-    <div id="status">レシートを撮影してください</div>
-    <button id="shoot" class="btn">📷 カメラを起動</button>
-    <button id="retry" class="btn secondary" hidden>↻ 再送信</button>
-    <div id="hint">標準カメラで撮影(フォーカス・ライト自由)→ 確定で自動送信</div>
+  <!-- 待機画面: タップで即カメラ -->
+  <div id="scr-idle" class="screen active">
+    <div class="big">📷 画面をタップで撮影</div>
+    <div id="conn">サーバー接続を確認中…</div>
   </div>
+
+  <!-- 処理中/エラー画面 -->
+  <div id="scr-busy" class="screen">
+    <img id="thumb" alt="">
+    <div id="busy-status"></div>
+    <button id="retry" class="btn secondary" hidden>↻ 再送信</button>
+    <button id="reshoot" class="btn" hidden>📷 撮り直す</button>
+  </div>
+
+  <!-- OCR結果編集画面 -->
+  <div id="scr-edit" class="screen">
+    <div class="head-grid">
+      <div><label>店舗</label><input id="f-store"></div>
+      <div><label>日付</label><input id="f-date" type="date"></div>
+      <div><label>合計(円)</label><input id="f-total" type="number" inputmode="numeric"></div>
+      <div><label>支払方法</label><select id="f-payment"></select></div>
+      <div><label>店舗種別</label><select id="f-storetype"></select></div>
+      <div><label>種別</label><select id="f-kind"><option>支出</option><option>収入</option></select></div>
+    </div>
+    <h2>明細(タップで修正・✕で削除)</h2>
+    <div id="items"></div>
+    <div id="ok-bar">
+      <button id="cancel" class="btn secondary" style="flex:0 0 100px">破棄</button>
+      <button id="ok" class="btn">✅ OK(登録して閉じる)</button>
+    </div>
+  </div>
+
   <input id="file" type="file" accept="image/*" capture="environment" hidden>
-  <script src="app.js?v=2"></script>
+  <script src="app.js?v=3"></script>
 </body>
 </html>
