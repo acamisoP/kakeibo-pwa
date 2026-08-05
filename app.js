@@ -8,7 +8,7 @@ const GAS_URL = (() => {
   return localStorage.getItem('kakeibo_gas_url') || '';
 })();
 
-const MAX_EDGE = 2200;   // レシートの文字が読める範囲でアップロードを軽く(速度・トークン節約)
+const MAX_EDGE = 1800;   // レシートの文字が読める範囲でアップロードを軽く(速度・トークン節約)
 const TIMEOUT_MS = 60000;
 const GENRES = ['食費', '嗜好品', 'タバコ', '外食費', '防衛費', '車両費', '交通費', '旅費', '日用品', '医療・健康', 'サブスク(固定費)', '仕事(経費)', 'その他', '給与', '副収入'];
 const PAYMENTS = ['楽天ペイ', 'Sonyデビット', 'PayPay', 'd払い', 'dポイント', 'PayPal', '現金', 'その他'];
@@ -224,82 +224,93 @@ function isQuota_(o) {
   return s.indexOf('429') !== -1 || s.indexOf('無料枠') !== -1;
 }
 
+let quotaPauseUntil = 0; // 無料枠429を踏んだら全ワーカーがここまで待つ
+
 async function startBatch(list, enqueue) {
   show('batch');
   $('batch-list').innerHTML = '';
   $('batch-done').hidden = true;
   batchItems = list.map(x => ({
     file: x.file, fname: x.fname || (x.file && x.file.name) || '画像', qid: x.qid,
-    rot: 0, receipt: null, imageUrl: null, status: 'wait', error: null, rowEl: null, phase: null,
+    rot: 0, receipt: null, imageUrl: null, status: 'wait', error: null, rowEl: null,
   }));
   if (enqueue) {
     for (const it of batchItems) {
       try { await idb.put({ id: it.qid, name: it.fname, blob: it.file }); } catch (e) { }
     }
   }
-  for (let i = 0; i < batchItems.length; i++) {
-    await processEntry_(batchItems[i], i);
-    if (navigator.vibrate) navigator.vibrate(15);
-  }
+  // 2並列で壁時間を半減(枠制限は quotaPauseUntil で全体停止するので安全)
+  quotaPauseUntil = 0;
+  let next = 0, done = 0;
+  const stat = () => {
+    $('batch-stat').textContent = done + ' / ' + batchItems.length + ' 完了' +
+      (done < batchItems.length ? ' — 処理中…' : '');
+  };
+  stat();
+  const worker = async () => {
+    while (next < batchItems.length) {
+      const i = next++;
+      await processEntry_(batchItems[i]);
+      done++;
+      stat();
+      if (navigator.vibrate) navigator.vibrate(15);
+    }
+  };
+  await Promise.all([worker(), worker()]);
   finishBatch();
   if (navigator.vibrate) navigator.vibrate(80);
 }
 
-async function processEntry_(it, i) {
+async function processEntry_(it) {
   makeRow(it, it.fname, null, 'working');
+  const cell = it.rowEl.querySelector('.a'); // 金額セルにフェーズ+経過秒を表示
   const t0 = Date.now();
-  const phase = txt => {
-    it.phase = txt;
-    $('batch-stat').textContent = (i + 1) + ' / ' + batchItems.length + ' ' + txt;
-  };
-  // 何が起きているか見えるように、フェーズ+経過秒を1秒毎に更新
+  let phaseTxt = '';
+  const phase = txt => { phaseTxt = txt; cell.textContent = txt; };
   const tick = setInterval(() => {
-    if (it.phase) $('batch-stat').textContent =
-      (i + 1) + ' / ' + batchItems.length + ' ' + it.phase + ' ' + Math.round((Date.now() - t0) / 1000) + '秒';
+    if (phaseTxt) cell.textContent = phaseTxt + ' ' + Math.round((Date.now() - t0) / 1000) + '秒';
   }, 1000);
   try {
     for (let attempt = 0; ; attempt++) {
-      phase('画像を圧縮中…');
+      while (Date.now() < quotaPauseUntil) {
+        phase('枠回復待ち ' + Math.ceil((quotaPauseUntil - Date.now()) / 1000) + '秒');
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      phase('圧縮中');
       const { base64 } = await resizeToJpeg(it.file, MAX_EDGE, it.rot);
-      phase('AI読取中…');
-      const ocr = await postJson_({ image: base64, mime: 'image/jpeg', skipFallback: true }, TIMEOUT_MS);
-      if (!ocr.ok && ocr.geminiFailed && isQuota_(ocr) && attempt === 0) {
-        // 無料枠のレート制限: 60秒待って同じ画像をもう一度だけ試す(以降のファイルの全滅を防ぐ)
-        it.phase = null;
-        for (let s = 60; s > 0; s--) {
-          $('batch-stat').textContent = (i + 1) + ' / ' + batchItems.length + ' 無料枠の回復待ち ' + s + '秒…';
-          await new Promise(r => setTimeout(r, 1000));
-        }
+      phase('AI読取+登録中');
+      // auto: OCR→Notion登録までGAS側で一気に行う(往復1回分速い)
+      const res = await postJson_({ mode: 'auto', image: base64, mime: 'image/jpeg' }, 90000);
+      if (!res.ok && res.geminiFailed && isQuota_(res) && attempt === 0) {
+        quotaPauseUntil = Date.now() + 60000; // 全ワーカー一時停止→同じ画像を再試行
         continue;
       }
-      if (ocr.ok && ocr.receipt) {
-        it.receipt = fixPayment(ocr.receipt);
-        it.imageUrl = ocr.imageUrl || null;
-        phase('Notionへ登録中…');
-        const commit = await postJson_({ mode: 'commit', receipt: it.receipt, imageUrl: it.imageUrl }, TIMEOUT_MS);
-        if (!commit.ok) throw new Error(commit.error || 'commit失敗');
-        it.status = commit.result || 'created';
-        makeRow(it, it.receipt.store || it.fname, it.receipt.total, it.status);
+      phaseTxt = '';
+      if (res.ok && res.result) {
+        it.receipt = res.receipt || null;
+        it.imageUrl = res.imageUrl || null;
+        it.status = res.result;
+        makeRow(it, (res.receipt && res.receipt.store) || it.fname, res.receipt && res.receipt.total, it.status);
         idb.del(it.qid).catch(() => { });
-      } else if (ocr.geminiFailed || (ocr.ok && ocr.needsReview)) {
-        // AI読取失敗: ページは作られていない(skipFallback)。行タップで手動入力
-        it.imageUrl = ocr.imageUrl || null;
+      } else if (res.geminiFailed) {
+        // AI読取失敗: ページは作られていない。行タップで手動入力
+        it.imageUrl = res.imageUrl || null;
         it.status = 'review';
-        it.error = ocr.error || null;
-        const note = (ocr.error && ocr.error !== 'AI読取失敗') ? ' — ' + ocr.error : ' — タップで手動入力';
+        it.error = res.error || null;
+        const note = (res.error && res.error !== 'AI読取失敗') ? ' — ' + res.error : ' — タップで手動入力';
         makeRow(it, it.fname + note, null, 'review');
       } else {
-        throw new Error(ocr.error || '不明なエラー');
+        throw new Error(res.error || '不明なエラー');
       }
       break;
     }
   } catch (e) {
+    phaseTxt = '';
     it.status = 'error';
     it.error = e.name === 'AbortError' ? '応答なし' : String(e);
     makeRow(it, it.fname + ' — タップで再試行', null, 'error');
   }
   clearInterval(tick);
-  it.phase = null;
 }
 
 /** 失敗=最初からやり直してから編集画面 / 要確認=AI再挑戦はせず空フォームで手動入力 */
