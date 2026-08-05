@@ -8,7 +8,7 @@ const GAS_URL = (() => {
   return localStorage.getItem('kakeibo_gas_url') || '';
 })();
 
-const MAX_EDGE = 2560;
+const MAX_EDGE = 2200;   // レシートの文字が読める範囲でアップロードを軽く(速度・トークン節約)
 const TIMEOUT_MS = 60000;
 const GENRES = ['食費', '嗜好品', 'タバコ', '外食費', '防衛費', '車両費', '交通費', '旅費', '日用品', '医療・健康', 'サブスク(固定費)', '仕事(経費)', 'その他', '給与', '副収入'];
 const PAYMENTS = ['楽天ペイ', 'Sonyデビット', 'PayPay', 'd払い', 'dポイント', 'PayPal', '現金', 'その他'];
@@ -30,6 +30,47 @@ function setBusy(text, cls) {
   $('busy-status').className = cls || '';
 }
 
+// ---------- 中断復帰用の永続キュー(IndexedDB) ----------
+// アプリ強制終了・カメラ起動中のプロセスkill・別アプリ移動でページが破棄されても、
+// 選択済みの画像はここに残り、次回起動時に自動で続きから処理する。
+// ※起動直後のinitから参照されるため、initより前に定義しておくこと
+const idb = {
+  _db: null,
+  open() {
+    if (this._db) return Promise.resolve(this._db);
+    return new Promise((ok, ng) => {
+      const rq = indexedDB.open('kakeibo-queue', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('q', { keyPath: 'id' });
+      rq.onsuccess = () => { this._db = rq.result; ok(this._db); };
+      rq.onerror = () => ng(rq.error);
+    });
+  },
+  async put(rec) {
+    const db = await this.open();
+    return new Promise((ok, ng) => {
+      const tx = db.transaction('q', 'readwrite');
+      tx.objectStore('q').put(rec);
+      tx.oncomplete = ok; tx.onerror = () => ng(tx.error);
+    });
+  },
+  async del(id) {
+    const db = await this.open();
+    return new Promise(ok => {
+      const tx = db.transaction('q', 'readwrite');
+      tx.objectStore('q').delete(id);
+      tx.oncomplete = ok; tx.onerror = ok;
+    });
+  },
+  async all() {
+    const db = await this.open();
+    return new Promise(ok => {
+      const rq = db.transaction('q').objectStore('q').getAll();
+      rq.onsuccess = () => ok(rq.result || []);
+      rq.onerror = () => ok([]);
+    });
+  },
+};
+
 function startTimer(prefix) {
   const t0 = Date.now();
   stopTimer();
@@ -46,8 +87,18 @@ function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } 
     $('conn').className = 'err';
     return;
   }
+  // 前回中断した読み込みが残っていれば自動で再開(カメラ起動中のプロセスkill・強制終了対策)
+  let resumed = false;
+  try {
+    const pend = await idb.all();
+    if (pend.length) {
+      resumed = true;
+      startBatch(pend.map(r => ({ file: r.blob, fname: r.name, qid: r.id })), false);
+    }
+  } catch (e) { }
+
   // 自動でカメラを開く(ブラウザがユーザー操作を要求する場合はタップ待ち)
-  $('file').click();
+  if (!resumed) $('file').click();
 
   try {
     const c = new AbortController();
@@ -80,6 +131,10 @@ $('file').addEventListener('change', async () => {
   const file = $('file').files && $('file').files[0];
   $('file').value = '';
   if (!file) return;
+  // 撮影直後に永続化(カメラ復帰時にページが破棄されても写真を失わない)
+  if (singleQid) idb.del(singleQid).catch(() => { });
+  singleQid = 's' + Date.now();
+  try { await idb.put({ id: singleQid, name: file.name || 'photo.jpg', blob: file }); } catch (e) { }
   show('busy');
   $('retry').hidden = true; $('reshoot').hidden = true; $('backbatch').hidden = true;
   try {
@@ -112,8 +167,9 @@ const BATCH_BADGE = {
   created: '新規', merged: 'マージ', duplicate: '重複スキップ',
   review: '要確認', error: '失敗', working: '処理中',
 };
-let batchItems = []; // 1ファイル=1エントリ {file, receipt, imageUrl, status, error, rowEl, phase}
+let batchItems = []; // 1ファイル=1エントリ {file, fname, qid, rot, receipt, imageUrl, status, error, rowEl, phase}
 let batchCtx = null; // 編集画面が一括のどの行から開かれたか(通常撮影ならnull)
+let singleQid = null; // 通常撮影の永続キューID
 
 const fixPayment = r => Object.assign({}, r, r.payment === '不明' ? { payment: 'その他' } : null);
 function blankReceipt() {
@@ -155,34 +211,67 @@ function finishBatch() {
   $('batch-done').hidden = false;
 }
 
-$('files').addEventListener('change', async () => {
+$('files').addEventListener('change', () => {
   const files = [...($('files').files || [])];
   $('files').value = '';
   if (!files.length) return;
+  startBatch(files.map((f, i) => ({ file: f, fname: f.name, qid: 'b' + Date.now() + '-' + i })), true);
+});
 
+/** 429(無料枠レート制限)の応答か */
+function isQuota_(o) {
+  const s = String((o && (o.detail || o.error)) || o || '');
+  return s.indexOf('429') !== -1 || s.indexOf('無料枠') !== -1;
+}
+
+async function startBatch(list, enqueue) {
   show('batch');
   $('batch-list').innerHTML = '';
   $('batch-done').hidden = true;
-  batchItems = files.map(f => ({ file: f, receipt: null, imageUrl: null, status: 'wait', rowEl: null, phase: null }));
-
+  batchItems = list.map(x => ({
+    file: x.file, fname: x.fname || (x.file && x.file.name) || '画像', qid: x.qid,
+    rot: 0, receipt: null, imageUrl: null, status: 'wait', error: null, rowEl: null, phase: null,
+  }));
+  if (enqueue) {
+    for (const it of batchItems) {
+      try { await idb.put({ id: it.qid, name: it.fname, blob: it.file }); } catch (e) { }
+    }
+  }
   for (let i = 0; i < batchItems.length; i++) {
-    const it = batchItems[i];
-    makeRow(it, it.file.name, null, 'working');
-    const t0 = Date.now();
-    const phase = txt => {
-      it.phase = txt;
-      $('batch-stat').textContent = (i + 1) + ' / ' + batchItems.length + ' ' + txt;
-    };
-    // 何が起きているか見えるように、フェーズ+経過秒を1秒毎に更新
-    const tick = setInterval(() => {
-      if (it.phase) $('batch-stat').textContent =
-        (i + 1) + ' / ' + batchItems.length + ' ' + it.phase + ' ' + Math.round((Date.now() - t0) / 1000) + '秒';
-    }, 1000);
-    try {
+    await processEntry_(batchItems[i], i);
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+  finishBatch();
+  if (navigator.vibrate) navigator.vibrate(80);
+}
+
+async function processEntry_(it, i) {
+  makeRow(it, it.fname, null, 'working');
+  const t0 = Date.now();
+  const phase = txt => {
+    it.phase = txt;
+    $('batch-stat').textContent = (i + 1) + ' / ' + batchItems.length + ' ' + txt;
+  };
+  // 何が起きているか見えるように、フェーズ+経過秒を1秒毎に更新
+  const tick = setInterval(() => {
+    if (it.phase) $('batch-stat').textContent =
+      (i + 1) + ' / ' + batchItems.length + ' ' + it.phase + ' ' + Math.round((Date.now() - t0) / 1000) + '秒';
+  }, 1000);
+  try {
+    for (let attempt = 0; ; attempt++) {
       phase('画像を圧縮中…');
-      const { base64 } = await resizeToJpeg(it.file, MAX_EDGE);
+      const { base64 } = await resizeToJpeg(it.file, MAX_EDGE, it.rot);
       phase('AI読取中…');
       const ocr = await postJson_({ image: base64, mime: 'image/jpeg', skipFallback: true }, TIMEOUT_MS);
+      if (!ocr.ok && ocr.geminiFailed && isQuota_(ocr) && attempt === 0) {
+        // 無料枠のレート制限: 60秒待って同じ画像をもう一度だけ試す(以降のファイルの全滅を防ぐ)
+        it.phase = null;
+        for (let s = 60; s > 0; s--) {
+          $('batch-stat').textContent = (i + 1) + ' / ' + batchItems.length + ' 無料枠の回復待ち ' + s + '秒…';
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        continue;
+      }
       if (ocr.ok && ocr.receipt) {
         it.receipt = fixPayment(ocr.receipt);
         it.imageUrl = ocr.imageUrl || null;
@@ -190,27 +279,28 @@ $('files').addEventListener('change', async () => {
         const commit = await postJson_({ mode: 'commit', receipt: it.receipt, imageUrl: it.imageUrl }, TIMEOUT_MS);
         if (!commit.ok) throw new Error(commit.error || 'commit失敗');
         it.status = commit.result || 'created';
-        makeRow(it, it.receipt.store || it.file.name, it.receipt.total, it.status);
+        makeRow(it, it.receipt.store || it.fname, it.receipt.total, it.status);
+        idb.del(it.qid).catch(() => { });
       } else if (ocr.geminiFailed || (ocr.ok && ocr.needsReview)) {
         // AI読取失敗: ページは作られていない(skipFallback)。行タップで手動入力
         it.imageUrl = ocr.imageUrl || null;
         it.status = 'review';
-        makeRow(it, it.file.name + ' — タップで手動入力', null, 'review');
+        it.error = ocr.error || null;
+        const note = (ocr.error && ocr.error !== 'AI読取失敗') ? ' — ' + ocr.error : ' — タップで手動入力';
+        makeRow(it, it.fname + note, null, 'review');
       } else {
         throw new Error(ocr.error || '不明なエラー');
       }
-    } catch (e) {
-      it.status = 'error';
-      it.error = e.name === 'AbortError' ? '応答なし' : String(e);
-      makeRow(it, it.file.name + ' — タップで再試行', null, 'error');
+      break;
     }
-    clearInterval(tick);
-    it.phase = null;
-    if (navigator.vibrate) navigator.vibrate(15);
+  } catch (e) {
+    it.status = 'error';
+    it.error = e.name === 'AbortError' ? '応答なし' : String(e);
+    makeRow(it, it.fname + ' — タップで再試行', null, 'error');
   }
-  finishBatch();
-  if (navigator.vibrate) navigator.vibrate(80);
-});
+  clearInterval(tick);
+  it.phase = null;
+}
 
 /** 失敗=最初からやり直してから編集画面 / 要確認=AI再挑戦はせず空フォームで手動入力 */
 async function editBatchRow(entry) {
@@ -219,7 +309,7 @@ async function editBatchRow(entry) {
     $('retry').hidden = true; $('reshoot').hidden = true; $('backbatch').hidden = true;
     try {
       setBusy('画像を圧縮中…');
-      const { base64, previewUrl } = await resizeToJpeg(entry.file, MAX_EDGE);
+      const { base64, previewUrl } = await resizeToJpeg(entry.file, MAX_EDGE, entry.rot);
       $('thumb').src = previewUrl;
       startTimer('AI読取中…(10〜20秒)');
       const ocr = await postJson_({ image: base64, mime: 'image/jpeg', skipFallback: true }, TIMEOUT_MS);
@@ -248,7 +338,11 @@ async function editBatchRow(entry) {
   show('edit');
 }
 
-$('batch-done').addEventListener('click', () => { show('idle'); });
+$('batch-done').addEventListener('click', () => {
+  // 完了=残った要確認/失敗も含め意図的に閉じた扱い。永続キューを掃除(元画像はギャラリーにある)
+  batchItems.forEach(it => { if (it.qid) idb.del(it.qid).catch(() => { }); });
+  show('idle');
+});
 $('backbatch').addEventListener('click', () => { show('batch'); });
 
 async function sendOcr(payload) {
@@ -404,11 +498,12 @@ $('ok').addEventListener('click', async () => {
       if (!commit.ok) throw new Error(commit.error || 'commit失敗');
       entry.receipt = receipt;
       entry.status = commit.result || 'created';
-      makeRow(entry, receipt.store || entry.file.name, receipt.total, entry.status);
+      makeRow(entry, receipt.store || entry.fname, receipt.total, entry.status);
+      if (entry.qid) idb.del(entry.qid).catch(() => { });
     } catch (e) {
       entry.status = 'error';
       entry.error = String(e);
-      makeRow(entry, entry.file.name + ' — 登録失敗・タップで再試行', null, 'error');
+      makeRow(entry, entry.fname + ' — 登録失敗・タップで再試行', null, 'error');
     } finally {
       $('ok').disabled = false;
       document.body.style.background = '#111';
@@ -419,6 +514,7 @@ $('ok').addEventListener('click', async () => {
     return;
   }
 
+  if (singleQid) { idb.del(singleQid).catch(() => { }); singleQid = null; }
   const body = JSON.stringify({ mode: 'commit', receipt, imageUrl });
   const sent = navigator.sendBeacon(GAS_URL, new Blob([body], { type: 'text/plain;charset=utf-8' }));
   if (!sent) { // beacon不可なら通常fetch(待たずに閉じる)
@@ -438,6 +534,7 @@ $('cancel').addEventListener('click', () => {
   ocrResult = null;
   document.body.style.background = '#111';
   if (batchCtx) { batchCtx = null; show('batch'); return; }
+  if (singleQid) { idb.del(singleQid).catch(() => { }); singleQid = null; } // 破棄=意図的な取消
   show('idle');
 });
 
@@ -449,8 +546,63 @@ function setEditImage(url) {
   }
   rimgUrl = url || null;
   $('rimg-sec').hidden = !url;
+  $('rimg-tools').hidden = !batchCtx; // 回転・再読取・書き起こしは元ファイルを持つ一括経由のみ
+  $('ocr-text').hidden = true;
   if (url) { $('rimg').src = url; rz.reset(); }
 }
+
+// ---------- 編集画面ツール: 回転 / この向きでAI再読取 / 文字の書き起こし ----------
+function showOcrText_(text) {
+  const el = $('ocr-text');
+  el.hidden = false;
+  el.textContent = text;
+}
+
+$('rot-r').addEventListener('click', async () => {
+  if (!batchCtx) return;
+  batchCtx.rot = ((batchCtx.rot || 0) + 1) % 4;
+  try {
+    const { previewUrl } = await resizeToJpeg(batchCtx.file, 1600, batchCtx.rot);
+    setEditImage(previewUrl);
+  } catch (e) { }
+});
+
+$('reocr').addEventListener('click', async () => {
+  if (!batchCtx) return;
+  const btn = $('reocr');
+  btn.disabled = true; btn.textContent = 'AI読取中…';
+  try {
+    const { base64 } = await resizeToJpeg(batchCtx.file, MAX_EDGE, batchCtx.rot);
+    const ocr = await postJson_({ image: base64, mime: 'image/jpeg', skipFallback: true }, TIMEOUT_MS);
+    if (ocr.ok && ocr.receipt) {
+      batchCtx.receipt = fixPayment(ocr.receipt);
+      batchCtx.imageUrl = ocr.imageUrl || batchCtx.imageUrl;
+      renderEdit(batchCtx.receipt);
+      showOcrText_('✓ 読み取れました。内容を確認してOKを押してください');
+    } else {
+      showOcrText_((ocr && ocr.error) || 'AI読取失敗');
+    }
+  } catch (e) {
+    showOcrText_('読取失敗: ' + (e.name === 'AbortError' ? '応答なし' : e));
+  }
+  btn.disabled = false; btn.textContent = 'この向きでAI再読取';
+});
+
+$('transcribe').addEventListener('click', async () => {
+  if (!batchCtx) return;
+  const btn = $('transcribe');
+  btn.disabled = true; btn.textContent = '書き起こし中…';
+  try {
+    const { base64 } = await resizeToJpeg(batchCtx.file, MAX_EDGE, batchCtx.rot);
+    const r = await postJson_({ mode: 'transcribe', image: base64, mime: 'image/jpeg' }, TIMEOUT_MS);
+    showOcrText_(r.ok
+      ? ((r.lines || []).join('\n') || '(文字が見つかりませんでした)')
+      : (r.error || '書き起こしに失敗しました'));
+  } catch (e) {
+    showOcrText_('書き起こし失敗: ' + (e.name === 'AbortError' ? '応答なし' : e));
+  }
+  btn.disabled = false; btn.textContent = '文字を書き起こす';
+});
 
 const rz = (() => {
   const img = $('rimg');
@@ -536,18 +688,24 @@ const rz = (() => {
   return { reset() { s = 1; tx = 0; ty = 0; ptrs.clear(); pinch = null; pan = null; apply(); } };
 })();
 
-// ---------- 画像リサイズ ----------
-async function resizeToJpeg(file, maxEdge) {
-  const bitmap = await createImageBitmap(file).catch(() => null);
+// ---------- 画像リサイズ(EXIF向き自動適用+90度単位の手動回転) ----------
+async function resizeToJpeg(file, maxEdge, quarterTurns) {
+  // imageOrientation:'from-image' でEXIFの回転情報を反映(横向き写真の自動補正)
+  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' }).catch(() => null);
   const img = bitmap || await loadImage(file);
   const w = img.width, h = img.height;
   const scale = Math.min(1, maxEdge / Math.max(w, h));
+  const sw = Math.round(w * scale), sh = Math.round(h * scale);
+  const rot = ((quarterTurns || 0) % 4 + 4) % 4;
   const canvas = document.createElement('canvas');
-  canvas.width = Math.round(w * scale);
-  canvas.height = Math.round(h * scale);
-  canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+  canvas.width = rot % 2 ? sh : sw;
+  canvas.height = rot % 2 ? sw : sh;
+  const ctx = canvas.getContext('2d');
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(rot * Math.PI / 2);
+  ctx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
   const blob = await new Promise((ok, ng) =>
-    canvas.toBlob(b => b ? ok(b) : ng(new Error('JPEG変換失敗')), 'image/jpeg', 0.85));
+    canvas.toBlob(b => b ? ok(b) : ng(new Error('JPEG変換失敗')), 'image/jpeg', 0.82));
   const base64 = await new Promise((ok, ng) => {
     const r = new FileReader();
     r.onload = () => ok(String(r.result).split(',')[1]);

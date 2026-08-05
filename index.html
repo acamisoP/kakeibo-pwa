@@ -113,6 +113,16 @@
   #rimg-wrap { border-radius: 18px; overflow: hidden; background: #0a0a0a;
     border: 1px solid #2c2c2c; touch-action: none; }
   #rimg { display: block; width: 100%; transform-origin: 0 0; will-change: transform; }
+  #rimg-tools { display: flex; gap: 8px; margin: 2px 0 10px; flex-wrap: wrap; }
+  .tool-btn { border: none; border-radius: 100px; background: var(--card2); color: var(--text);
+    font-size: 13px; font-weight: 700; padding: 10px 14px;
+    -webkit-tap-highlight-color: transparent; }
+  .tool-btn:active { filter: brightness(1.3); }
+  .tool-btn[disabled] { opacity: .5; }
+  /* 書き起こし結果: 長押しで選択・コピーできる素のテキスト */
+  #ocr-text { user-select: text; -webkit-user-select: text; white-space: pre-wrap;
+    background: var(--card); border-radius: 14px; padding: 14px; font-size: 14px;
+    line-height: 1.9; margin-bottom: 10px; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -181,12 +191,18 @@
     </div>
     <div id="rimg-sec" hidden>
       <h2>レシート画像(ピンチで拡大・ダブルタップでリセット)</h2>
+      <div id="rimg-tools" hidden>
+        <button class="tool-btn" id="rot-r">回転</button>
+        <button class="tool-btn" id="reocr">この向きでAI再読取</button>
+        <button class="tool-btn" id="transcribe">文字を書き起こす</button>
+      </div>
+      <div id="ocr-text" hidden></div>
       <div id="rimg-wrap"><img id="rimg" alt="レシート"></div>
     </div>
   </div>
 
   <input id="file" type="file" accept="image/*" capture="environment" hidden>
   <input id="files" type="file" accept="image/*" multiple hidden>
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=9"></script>
 </body>
 </html>
