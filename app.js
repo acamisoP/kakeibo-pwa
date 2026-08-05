@@ -15,7 +15,7 @@ const PAYMENTS = ['楽天ペイ', 'Sonyデビット', 'PayPay', 'd払い', 'dポ
 const STORE_TYPES = ['スーパー', 'コンビニ', 'EC', '実店舗その他'];
 
 const $ = id => document.getElementById(id);
-const screens = { idle: $('scr-idle'), busy: $('scr-busy'), edit: $('scr-edit') };
+const screens = { idle: $('scr-idle'), busy: $('scr-busy'), edit: $('scr-edit'), batch: $('scr-batch') };
 let ocrResult = null;   // {receipt, imageUrl}
 let lastPayload = null; // 再送信用
 let timerId = null;
@@ -68,8 +68,9 @@ function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } 
   }
 })();
 
-// 待機画面のどこをタップしてもカメラ起動
-screens.idle.addEventListener('click', () => { if (GAS_URL) $('file').click(); });
+// カード単位のハンドラ(フォルダカードと競合するため全画面タップは廃止)
+$('capture-card').addEventListener('click', () => { if (GAS_URL) $('file').click(); });
+$('folder-card').addEventListener('click', () => { if (GAS_URL) $('files').click(); });
 $('reshoot').addEventListener('click', () => $('file').click());
 $('retry').addEventListener('click', () => { if (lastPayload) sendOcr(lastPayload); });
 
@@ -92,6 +93,84 @@ $('file').addEventListener('change', async () => {
   }
 });
 
+// ---------- フォルダ一括読み込み(全自動登録: OCR→即commit、編集画面なし) ----------
+async function postJson_(bodyObj, timeoutMs) {
+  const c = new AbortController();
+  const to = setTimeout(() => c.abort(), timeoutMs || TIMEOUT_MS);
+  try {
+    const res = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(bodyObj), signal: c.signal, redirect: 'follow',
+    });
+    return await res.json();
+  } finally { clearTimeout(to); }
+}
+
+const BATCH_BADGE = {
+  created: '新規', merged: 'マージ', duplicate: '重複スキップ',
+  review: '要確認', error: '失敗',
+};
+function addBatchRow(name, amount, kind) {
+  const row = document.createElement('div');
+  row.className = 'b-row';
+  const n = document.createElement('div');
+  n.className = 'n'; n.textContent = name;
+  const a = document.createElement('div');
+  a.className = 'a'; a.textContent = amount != null ? '¥' + Number(amount).toLocaleString('ja-JP') : '';
+  const b = document.createElement('span');
+  b.className = 'badge ' + kind; b.textContent = BATCH_BADGE[kind] || kind;
+  row.append(n, a, b);
+  $('batch-list').appendChild(row);
+}
+
+$('files').addEventListener('change', async () => {
+  const files = [...($('files').files || [])];
+  $('files').value = '';
+  if (!files.length) return;
+
+  show('batch');
+  $('batch-list').innerHTML = '';
+  $('batch-done').hidden = true;
+  const counts = { created: 0, merged: 0, duplicate: 0, review: 0, error: 0 };
+
+  for (let i = 0; i < files.length; i++) {
+    $('batch-stat').textContent = (i + 1) + ' / ' + files.length + ' 処理中…';
+    try {
+      const { base64 } = await resizeToJpeg(files[i], MAX_EDGE);
+      const ocr = await postJson_({ image: base64, mime: 'image/jpeg' }, TIMEOUT_MS);
+      if (ocr.ok && ocr.receipt) {
+        // 全自動: 編集画面を出さずそのまま登録(後から修正する運用)
+        const fixed = Object.assign({}, ocr.receipt,
+          ocr.receipt.payment === '不明' ? { payment: 'その他' } : null);
+        const commit = await postJson_({ mode: 'commit', receipt: fixed, imageUrl: ocr.imageUrl || null }, TIMEOUT_MS);
+        if (!commit.ok) throw new Error(commit.error || 'commit失敗');
+        const kind = commit.result || 'created';
+        counts[kind] = (counts[kind] || 0) + 1;
+        addBatchRow(ocr.receipt.store || files[i].name, ocr.receipt.total, kind);
+      } else if (ocr.ok && ocr.needsReview) {
+        counts.review++;
+        addBatchRow(files[i].name + '(読取失敗・画像は登録済み)', null, 'review');
+      } else {
+        throw new Error(ocr.error || '不明なエラー');
+      }
+    } catch (e) {
+      counts.error++;
+      addBatchRow(files[i].name + ': ' + (e.name === 'AbortError' ? '応答なし' : e), null, 'error');
+    }
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+
+  $('batch-stat').textContent = files.length + '件完了 — 新規' + counts.created +
+    ' / マージ' + counts.merged + ' / 重複' + counts.duplicate +
+    (counts.review ? ' / 要確認' + counts.review : '') +
+    (counts.error ? ' / 失敗' + counts.error : '');
+  $('batch-done').hidden = false;
+  if (navigator.vibrate) navigator.vibrate(80);
+});
+
+$('batch-done').addEventListener('click', () => { show('idle'); });
+
 async function sendOcr(payload) {
   show('busy');
   $('retry').hidden = true; $('reshoot').hidden = true;
@@ -112,14 +191,14 @@ async function sendOcr(payload) {
       show('edit');
       if (navigator.vibrate) navigator.vibrate(50);
     } else if (json.ok && json.needsReview) {
-      setBusy('⚠️ AI読取失敗。画像だけNotionに登録済み\n(【要確認】ページを後で修正してください)');
+      setBusy('! AI読取失敗。画像だけNotionに登録済み\n(【要確認】ページを後で修正してください)');
       $('reshoot').hidden = false;
     } else {
       throw new Error(json.error || '不明なエラー');
     }
   } catch (e) {
     stopTimer();
-    setBusy('❌ 送信失敗\n' + (e.name === 'AbortError'
+    setBusy('✗ 送信失敗\n' + (e.name === 'AbortError'
       ? '60秒応答なし。電波の良い場所で再送信してください'
       : String(e)), 'err');
     $('retry').hidden = false;
@@ -237,7 +316,7 @@ $('ok').addEventListener('click', () => {
   setTimeout(() => {
     document.body.style.background = '#111';
     show('idle');
-    $('conn').textContent = '✅ 登録を送信しました(閉じてOK)';
+    $('conn').textContent = '✓ 登録を送信しました(閉じてOK)';
     $('conn').className = 'ok';
   }, 300);
 });
