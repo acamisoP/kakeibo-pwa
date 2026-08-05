@@ -244,6 +244,7 @@ async function editBatchRow(entry) {
   batchCtx = entry;
   ocrResult = { receipt: entry.receipt, imageUrl: entry.imageUrl };
   renderEdit(entry.receipt);
+  setEditImage(URL.createObjectURL(entry.file)); // 元画像を見ながら入力できるように
   show('edit');
 }
 
@@ -267,6 +268,7 @@ async function sendOcr(payload) {
     if (json.ok && json.receipt) {
       ocrResult = json;
       renderEdit(json.receipt);
+      setEditImage($('thumb').src || null); // 撮影プレビューを編集画面でも表示
       show('edit');
       if (navigator.vibrate) navigator.vibrate(50);
     } else if (json.ok && json.needsReview) {
@@ -438,6 +440,101 @@ $('cancel').addEventListener('click', () => {
   if (batchCtx) { batchCtx = null; show('batch'); return; }
   show('idle');
 });
+
+// ---------- 編集画面のレシート画像(ピンチ拡大・パン・ダブルタップ) ----------
+let rimgUrl = null;
+function setEditImage(url) {
+  if (rimgUrl && rimgUrl !== url && rimgUrl.indexOf('blob:') === 0) {
+    try { URL.revokeObjectURL(rimgUrl); } catch (e) { }
+  }
+  rimgUrl = url || null;
+  $('rimg-sec').hidden = !url;
+  if (url) { $('rimg').src = url; rz.reset(); }
+}
+
+const rz = (() => {
+  const img = $('rimg');
+  const wrap = $('rimg-wrap');
+  let s = 1, tx = 0, ty = 0;          // scale / 平行移動(px)
+  const ptrs = new Map();             // pointerId -> {x, y}
+  let pinch = null;                   // {d0, m0:{x,y}, s0, tx0, ty0}
+  let pan = null;                     // {x, y, tx0, ty0}
+  let lastTap = 0;
+
+  const apply = () => {
+    img.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + s + ')';
+  };
+  const clamp = () => {
+    s = Math.min(Math.max(s, 1), 6);
+    const w = wrap.clientWidth, h = img.offsetHeight;
+    tx = Math.min(0, Math.max(tx, w - w * s));
+    ty = Math.min(0, Math.max(ty, h - h * s));
+    if (s <= 1.001) { s = 1; tx = 0; ty = 0; }
+  };
+  const local = e => {
+    const r = wrap.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
+  wrap.addEventListener('pointerdown', e => {
+    try { wrap.setPointerCapture(e.pointerId); } catch (err) { }
+    ptrs.set(e.pointerId, local(e));
+    const pts = [...ptrs.values()];
+    if (pts.length === 2) {
+      pinch = {
+        d0: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1,
+        m0: { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 },
+        s0: s, tx0: tx, ty0: ty,
+      };
+      pan = null;
+    } else if (pts.length === 1) {
+      pan = { x: pts[0].x, y: pts[0].y, tx0: tx, ty0: ty, moved: false };
+    }
+  });
+  wrap.addEventListener('pointermove', e => {
+    if (!ptrs.has(e.pointerId)) return;
+    ptrs.set(e.pointerId, local(e));
+    const pts = [...ptrs.values()];
+    if (pinch && pts.length === 2) {
+      const d1 = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) || 1;
+      const m1 = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      s = pinch.s0 * d1 / pinch.d0;
+      // ピンチ中点の直下にある画像上の点を固定する
+      tx = m1.x - (pinch.m0.x - pinch.tx0) / pinch.s0 * s;
+      ty = m1.y - (pinch.m0.y - pinch.ty0) / pinch.s0 * s;
+      clamp(); apply();
+    } else if (pan && pts.length === 1 && s > 1) {
+      const dx = pts[0].x - pan.x, dy = pts[0].y - pan.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) pan.moved = true;
+      tx = pan.tx0 + dx; ty = pan.ty0 + dy;
+      clamp(); apply();
+    }
+  });
+  const up = e => {
+    if (!ptrs.has(e.pointerId)) return;
+    const wasPinch = !!pinch;
+    const tapCandidate = pan && !pan.moved && !wasPinch;
+    ptrs.delete(e.pointerId);
+    if (ptrs.size < 2) pinch = null;
+    if (ptrs.size === 0) {
+      if (tapCandidate) {
+        const now = Date.now();
+        if (now - lastTap < 320) { // ダブルタップ: 2.5倍 ↔ 等倍
+          const p = local(e);
+          if (s > 1) { s = 1; tx = 0; ty = 0; }
+          else { const z = 2.5; tx = p.x - p.x * z; ty = p.y - p.y * z; s = z; }
+          clamp(); apply();
+          lastTap = 0;
+        } else lastTap = now;
+      }
+      pan = null;
+    }
+  };
+  wrap.addEventListener('pointerup', up);
+  wrap.addEventListener('pointercancel', up);
+
+  return { reset() { s = 1; tx = 0; ty = 0; ptrs.clear(); pinch = null; pan = null; apply(); } };
+})();
 
 // ---------- 画像リサイズ ----------
 async function resizeToJpeg(file, maxEdge) {

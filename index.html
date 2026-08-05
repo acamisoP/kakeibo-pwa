@@ -108,6 +108,11 @@
   .btn[hidden] { display: none; }
   #ok-bar { position: sticky; bottom: 0; padding: 12px 0 4px;
     background: linear-gradient(transparent, var(--bg) 35%); display: flex; gap: 10px; }
+
+  /* ---- 編集画面のレシート画像(OKバー下)。ピンチで拡大・ドラッグで移動 ---- */
+  #rimg-wrap { border-radius: 18px; overflow: hidden; background: #0a0a0a;
+    border: 1px solid #2c2c2c; touch-action: none; }
+  #rimg { display: block; width: 100%; transform-origin: 0 0; will-change: transform; }
 </style>
 </head>
 <body>
@@ -174,10 +179,14 @@
       <button id="cancel" class="btn secondary" style="flex:0 0 96px">破棄</button>
       <button id="ok" class="btn">OK — 登録して閉じる</button>
     </div>
+    <div id="rimg-sec" hidden>
+      <h2>レシート画像(ピンチで拡大・ダブルタップでリセット)</h2>
+      <div id="rimg-wrap"><img id="rimg" alt="レシート"></div>
+    </div>
   </div>
 
   <input id="file" type="file" accept="image/*" capture="environment" hidden>
   <input id="files" type="file" accept="image/*" multiple hidden>
-  <script src="app.js?v=7"></script>
+  <script src="app.js?v=8"></script>
 </body>
 </html>
