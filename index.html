@@ -41,6 +41,7 @@
   #conn { font-size: 12px; color: var(--sub); padding: 2px 8px; }
   #conn.ok { color: var(--ok); } #conn.err { color: var(--err); }
   .flex-spacer { flex: 1; }
+  .spacer-sm { flex: 1.3; } /* カードを画面中央やや下(親指が届く高さ)に置くための下側余白 */
   /* 撮影/フォルダ読込: 同サイズ2カード(親指ゾーン)。アイコンのみ・テキストなし */
   #action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   .action-card {
@@ -69,6 +70,9 @@
   .badge.duplicate { background: #2e2e33; color: var(--sub); }
   .badge.review { background: #4a3413; color: #ffb454; }
   .badge.error { background: #442020; color: var(--err); }
+  .badge.working { background: #26303d; color: #9ec7ff; }
+  .b-row.editable { outline: 1px solid #3a3a40; }
+  .b-row.editable:active { filter: brightness(1.35); }
 
   /* ---- 処理中画面 ---- */
   #scr-busy { align-items: center; justify-content: center; text-align: center; gap: 20px; }
@@ -125,6 +129,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="#cfcfd4" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5A1.5 1.5 0 0 1 4 5h5l2 2.5h9a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 20 19.5H4A1.5 1.5 0 0 1 2.5 18z"/><path d="M12 10.5v5M9.8 13.3 12 15.5l2.2-2.2"/></svg>
       </div>
     </div>
+    <div class="spacer-sm"></div>
   </div>
 
   <!-- フォルダ一括読み込みの進捗+結果 -->
@@ -145,6 +150,7 @@
     <div id="busy-status"></div>
     <button id="retry" class="btn secondary" hidden>再送信</button>
     <button id="reshoot" class="btn" hidden>撮り直す</button>
+    <button id="backbatch" class="btn secondary" hidden>一覧へ戻る</button>
   </div>
 
   <!-- OCR結果編集 -->
@@ -163,6 +169,7 @@
     </div>
     <h2>明細(タップで修正・✕で削除)</h2>
     <div id="items"></div>
+    <button id="add-item" class="btn secondary" style="padding:12px;font-size:14px">明細を追加</button>
     <div id="ok-bar">
       <button id="cancel" class="btn secondary" style="flex:0 0 96px">破棄</button>
       <button id="ok" class="btn">OK — 登録して閉じる</button>
@@ -171,6 +178,6 @@
 
   <input id="file" type="file" accept="image/*" capture="environment" hidden>
   <input id="files" type="file" accept="image/*" multiple hidden>
-  <script src="app.js?v=6"></script>
+  <script src="app.js?v=7"></script>
 </body>
 </html>

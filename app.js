@@ -56,7 +56,8 @@ function stopTimer() { if (timerId) { clearInterval(timerId); timerId = null; } 
     const j = await r.json();
     if (j.ok) {
       $('summary-amount').textContent = '¥' + Number(j.total || 0).toLocaleString('ja-JP');
-      $('summary-sub').textContent = j.month + '月 / ' + j.count + '件の取引';
+      $('summary-sub').textContent = j.month + '月 / ' + j.count + '件の取引' +
+        (j.gemini != null ? ' ・ AI読取 今日' + j.gemini + '回' : '');
       $('conn').textContent = '✓ サーバー接続OK';
       $('conn').className = 'ok';
     } else throw new Error(j.error || 'unexpected');
@@ -80,7 +81,7 @@ $('file').addEventListener('change', async () => {
   $('file').value = '';
   if (!file) return;
   show('busy');
-  $('retry').hidden = true; $('reshoot').hidden = true;
+  $('retry').hidden = true; $('reshoot').hidden = true; $('backbatch').hidden = true;
   try {
     setBusy('画像を圧縮中…');
     const { base64, previewUrl } = await resizeToJpeg(file, MAX_EDGE);
@@ -109,19 +110,49 @@ async function postJson_(bodyObj, timeoutMs) {
 
 const BATCH_BADGE = {
   created: '新規', merged: 'マージ', duplicate: '重複スキップ',
-  review: '要確認', error: '失敗',
+  review: '要確認', error: '失敗', working: '処理中',
 };
-function addBatchRow(name, amount, kind) {
-  const row = document.createElement('div');
-  row.className = 'b-row';
-  const n = document.createElement('div');
-  n.className = 'n'; n.textContent = name;
-  const a = document.createElement('div');
-  a.className = 'a'; a.textContent = amount != null ? '¥' + Number(amount).toLocaleString('ja-JP') : '';
-  const b = document.createElement('span');
-  b.className = 'badge ' + kind; b.textContent = BATCH_BADGE[kind] || kind;
-  row.append(n, a, b);
-  $('batch-list').appendChild(row);
+let batchItems = []; // 1ファイル=1エントリ {file, receipt, imageUrl, status, error, rowEl, phase}
+let batchCtx = null; // 編集画面が一括のどの行から開かれたか(通常撮影ならnull)
+
+const fixPayment = r => Object.assign({}, r, r.payment === '不明' ? { payment: 'その他' } : null);
+function blankReceipt() {
+  return {
+    store: '', date: new Date().toISOString().slice(0, 10), total: 0,
+    payment: 'その他', store_type: '実店舗その他', kind: '支出', items: [],
+  };
+}
+
+/** 結果行を作成/更新する。失敗・要確認はタップで編集へ */
+function makeRow(entry, name, amount, kind) {
+  if (!entry.rowEl) {
+    entry.rowEl = document.createElement('div');
+    entry.rowEl.className = 'b-row';
+    entry.rowEl.innerHTML = '<div class="n"></div><div class="a"></div><span class="badge"></span>';
+    $('batch-list').appendChild(entry.rowEl);
+    entry.rowEl.addEventListener('click', () => {
+      if (entry.status === 'error' || entry.status === 'review') editBatchRow(entry);
+    });
+  }
+  entry.rowEl.querySelector('.n').textContent = name;
+  entry.rowEl.querySelector('.a').textContent =
+    amount != null ? '¥' + Number(amount).toLocaleString('ja-JP') : '';
+  const b = entry.rowEl.querySelector('.badge');
+  b.className = 'badge ' + kind;
+  b.textContent = BATCH_BADGE[kind] || kind;
+  entry.rowEl.classList.toggle('editable', kind === 'error' || kind === 'review');
+}
+
+function finishBatch() {
+  const counts = { created: 0, merged: 0, duplicate: 0, review: 0, error: 0 };
+  batchItems.forEach(it => { if (counts[it.status] != null) counts[it.status]++; });
+  const remain = counts.review + counts.error;
+  $('batch-stat').textContent = batchItems.length + '件完了 — 新規' + counts.created +
+    ' / マージ' + counts.merged + ' / 重複' + counts.duplicate +
+    (counts.review ? ' / 要確認' + counts.review : '') +
+    (counts.error ? ' / 失敗' + counts.error : '') +
+    (remain ? ' (行タップで修正)' : '');
+  $('batch-done').hidden = false;
 }
 
 $('files').addEventListener('change', async () => {
@@ -132,48 +163,96 @@ $('files').addEventListener('change', async () => {
   show('batch');
   $('batch-list').innerHTML = '';
   $('batch-done').hidden = true;
-  const counts = { created: 0, merged: 0, duplicate: 0, review: 0, error: 0 };
+  batchItems = files.map(f => ({ file: f, receipt: null, imageUrl: null, status: 'wait', rowEl: null, phase: null }));
 
-  for (let i = 0; i < files.length; i++) {
-    $('batch-stat').textContent = (i + 1) + ' / ' + files.length + ' 処理中…';
+  for (let i = 0; i < batchItems.length; i++) {
+    const it = batchItems[i];
+    makeRow(it, it.file.name, null, 'working');
+    const t0 = Date.now();
+    const phase = txt => {
+      it.phase = txt;
+      $('batch-stat').textContent = (i + 1) + ' / ' + batchItems.length + ' ' + txt;
+    };
+    // 何が起きているか見えるように、フェーズ+経過秒を1秒毎に更新
+    const tick = setInterval(() => {
+      if (it.phase) $('batch-stat').textContent =
+        (i + 1) + ' / ' + batchItems.length + ' ' + it.phase + ' ' + Math.round((Date.now() - t0) / 1000) + '秒';
+    }, 1000);
     try {
-      const { base64 } = await resizeToJpeg(files[i], MAX_EDGE);
-      const ocr = await postJson_({ image: base64, mime: 'image/jpeg' }, TIMEOUT_MS);
+      phase('画像を圧縮中…');
+      const { base64 } = await resizeToJpeg(it.file, MAX_EDGE);
+      phase('AI読取中…');
+      const ocr = await postJson_({ image: base64, mime: 'image/jpeg', skipFallback: true }, TIMEOUT_MS);
       if (ocr.ok && ocr.receipt) {
-        // 全自動: 編集画面を出さずそのまま登録(後から修正する運用)
-        const fixed = Object.assign({}, ocr.receipt,
-          ocr.receipt.payment === '不明' ? { payment: 'その他' } : null);
-        const commit = await postJson_({ mode: 'commit', receipt: fixed, imageUrl: ocr.imageUrl || null }, TIMEOUT_MS);
+        it.receipt = fixPayment(ocr.receipt);
+        it.imageUrl = ocr.imageUrl || null;
+        phase('Notionへ登録中…');
+        const commit = await postJson_({ mode: 'commit', receipt: it.receipt, imageUrl: it.imageUrl }, TIMEOUT_MS);
         if (!commit.ok) throw new Error(commit.error || 'commit失敗');
-        const kind = commit.result || 'created';
-        counts[kind] = (counts[kind] || 0) + 1;
-        addBatchRow(ocr.receipt.store || files[i].name, ocr.receipt.total, kind);
-      } else if (ocr.ok && ocr.needsReview) {
-        counts.review++;
-        addBatchRow(files[i].name + '(読取失敗・画像は登録済み)', null, 'review');
+        it.status = commit.result || 'created';
+        makeRow(it, it.receipt.store || it.file.name, it.receipt.total, it.status);
+      } else if (ocr.geminiFailed || (ocr.ok && ocr.needsReview)) {
+        // AI読取失敗: ページは作られていない(skipFallback)。行タップで手動入力
+        it.imageUrl = ocr.imageUrl || null;
+        it.status = 'review';
+        makeRow(it, it.file.name + ' — タップで手動入力', null, 'review');
       } else {
         throw new Error(ocr.error || '不明なエラー');
       }
     } catch (e) {
-      counts.error++;
-      addBatchRow(files[i].name + ': ' + (e.name === 'AbortError' ? '応答なし' : e), null, 'error');
+      it.status = 'error';
+      it.error = e.name === 'AbortError' ? '応答なし' : String(e);
+      makeRow(it, it.file.name + ' — タップで再試行', null, 'error');
     }
+    clearInterval(tick);
+    it.phase = null;
     if (navigator.vibrate) navigator.vibrate(15);
   }
-
-  $('batch-stat').textContent = files.length + '件完了 — 新規' + counts.created +
-    ' / マージ' + counts.merged + ' / 重複' + counts.duplicate +
-    (counts.review ? ' / 要確認' + counts.review : '') +
-    (counts.error ? ' / 失敗' + counts.error : '');
-  $('batch-done').hidden = false;
+  finishBatch();
   if (navigator.vibrate) navigator.vibrate(80);
 });
 
+/** 失敗=最初からやり直してから編集画面 / 要確認=AI再挑戦はせず空フォームで手動入力 */
+async function editBatchRow(entry) {
+  if (entry.status === 'error') {
+    show('busy');
+    $('retry').hidden = true; $('reshoot').hidden = true; $('backbatch').hidden = true;
+    try {
+      setBusy('画像を圧縮中…');
+      const { base64, previewUrl } = await resizeToJpeg(entry.file, MAX_EDGE);
+      $('thumb').src = previewUrl;
+      startTimer('AI読取中…(10〜20秒)');
+      const ocr = await postJson_({ image: base64, mime: 'image/jpeg', skipFallback: true }, TIMEOUT_MS);
+      stopTimer();
+      if (ocr.ok && ocr.receipt) {
+        entry.receipt = fixPayment(ocr.receipt);
+        entry.imageUrl = ocr.imageUrl || null;
+      } else if (ocr.geminiFailed) {
+        entry.imageUrl = ocr.imageUrl || entry.imageUrl;
+        entry.receipt = null; // AIが読めない画像 → 手動入力へ
+      } else {
+        throw new Error(ocr.error || '不明なエラー');
+      }
+    } catch (e) {
+      stopTimer();
+      setBusy('✗ 再試行も失敗\n' + (e.name === 'AbortError' ? '60秒応答なし。電波を確認してください' : String(e)), 'err');
+      $('backbatch').hidden = false;
+      return;
+    }
+  }
+  if (!entry.receipt) entry.receipt = blankReceipt();
+  batchCtx = entry;
+  ocrResult = { receipt: entry.receipt, imageUrl: entry.imageUrl };
+  renderEdit(entry.receipt);
+  show('edit');
+}
+
 $('batch-done').addEventListener('click', () => { show('idle'); });
+$('backbatch').addEventListener('click', () => { show('batch'); });
 
 async function sendOcr(payload) {
   show('busy');
-  $('retry').hidden = true; $('reshoot').hidden = true;
+  $('retry').hidden = true; $('reshoot').hidden = true; $('backbatch').hidden = true;
   startTimer('AI読取中…(10〜20秒)');
   const c = new AbortController();
   const to = setTimeout(() => c.abort(), TIMEOUT_MS);
@@ -254,27 +333,36 @@ function renderEdit(r) {
 
   const wrap = $('items');
   wrap.innerHTML = '';
-  (r.items || []).forEach(it => {
-    const div = document.createElement('div');
-    div.className = 'item';
-    const name = document.createElement('input');
-    name.value = it.normalized_name || it.raw_name || '';
-    name.dataset.raw = it.raw_name || '';
-    const r2 = document.createElement('div');
-    r2.className = 'r2';
-    const price = document.createElement('input');
-    price.type = 'number'; price.inputMode = 'numeric'; price.value = it.price || 0;
-    const genre = document.createElement('select');
-    fillSelect(genre, GENRES, it.genre);
-    const del = document.createElement('button');
-    del.className = 'del'; del.textContent = '✕';
-    del.onclick = () => div.remove();
-    r2.append(price, genre, del);
-    div.append(name, r2);
-    div.dataset.qty = it.quantity || 1;
-    wrap.appendChild(div);
-  });
+  (r.items || []).forEach(it => wrap.appendChild(makeItemRow(it)));
 }
+
+function makeItemRow(it) {
+  const div = document.createElement('div');
+  div.className = 'item';
+  const name = document.createElement('input');
+  name.value = it.normalized_name || it.raw_name || '';
+  name.dataset.raw = it.raw_name || '';
+  const r2 = document.createElement('div');
+  r2.className = 'r2';
+  const price = document.createElement('input');
+  price.type = 'number'; price.inputMode = 'numeric'; price.value = it.price || 0;
+  const genre = document.createElement('select');
+  fillSelect(genre, GENRES, it.genre);
+  const del = document.createElement('button');
+  del.className = 'del'; del.textContent = '✕';
+  del.onclick = () => div.remove();
+  r2.append(price, genre, del);
+  div.append(name, r2);
+  div.dataset.qty = it.quantity || 1;
+  return div;
+}
+
+// 手動入力用(AI読取失敗時は明細ゼロから始まるため)
+$('add-item').addEventListener('click', () => {
+  const row = makeItemRow({ raw_name: '', normalized_name: '', price: 0, quantity: 1, genre: 'その他' });
+  $('items').appendChild(row);
+  row.querySelector('input').focus();
+});
 
 function collectReceipt() {
   const items = [...$('items').children].map(div => {
@@ -300,13 +388,36 @@ function collectReceipt() {
   };
 }
 
-// OK: sendBeaconで登録を送信(ページを閉じても送信が完了する)→ 即クローズ
-$('ok').addEventListener('click', () => {
-  const body = JSON.stringify({
-    mode: 'commit',
-    receipt: collectReceipt(),
-    imageUrl: ocrResult && ocrResult.imageUrl,
-  });
+// OK: 通常撮影=sendBeaconで送信して即クローズ / 一括の修正=応答を待って結果一覧を更新
+$('ok').addEventListener('click', async () => {
+  const receipt = collectReceipt();
+  const imageUrl = (batchCtx ? batchCtx.imageUrl : (ocrResult && ocrResult.imageUrl)) || null;
+
+  if (batchCtx) {
+    const entry = batchCtx;
+    batchCtx = null;
+    $('ok').disabled = true;
+    try {
+      const commit = await postJson_({ mode: 'commit', receipt, imageUrl }, TIMEOUT_MS);
+      if (!commit.ok) throw new Error(commit.error || 'commit失敗');
+      entry.receipt = receipt;
+      entry.status = commit.result || 'created';
+      makeRow(entry, receipt.store || entry.file.name, receipt.total, entry.status);
+    } catch (e) {
+      entry.status = 'error';
+      entry.error = String(e);
+      makeRow(entry, entry.file.name + ' — 登録失敗・タップで再試行', null, 'error');
+    } finally {
+      $('ok').disabled = false;
+      document.body.style.background = '#111';
+      finishBatch();
+      show('batch');
+      if (navigator.vibrate) navigator.vibrate(40);
+    }
+    return;
+  }
+
+  const body = JSON.stringify({ mode: 'commit', receipt, imageUrl });
   const sent = navigator.sendBeacon(GAS_URL, new Blob([body], { type: 'text/plain;charset=utf-8' }));
   if (!sent) { // beacon不可なら通常fetch(待たずに閉じる)
     fetch(GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body, keepalive: true }).catch(() => {});
@@ -324,6 +435,7 @@ $('ok').addEventListener('click', () => {
 $('cancel').addEventListener('click', () => {
   ocrResult = null;
   document.body.style.background = '#111';
+  if (batchCtx) { batchCtx = null; show('batch'); return; }
   show('idle');
 });
 

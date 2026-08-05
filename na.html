@@ -45,6 +45,10 @@
   .empty { text-align: center; color: var(--sub); padding: 60px 20px; line-height: 2; }
   .empty svg { width: 44px; height: 44px; margin-bottom: 10px; stroke: #494950; }
   .empty .big { font-size: 16px; font-weight: 700; color: var(--text); }
+  .retry-btn { display: block; margin: 18px auto 0; padding: 13px 40px; border: none;
+    border-radius: 100px; background: var(--accent); color: #fff;
+    font-size: 15px; font-weight: 800; -webkit-tap-highlight-color: transparent; }
+  .retry-btn:active { filter: brightness(1.15); }
 
   /* 下部固定: ↑↓でカード移動 */
   #navbar { position: fixed; left: 0; right: 0; bottom: 0;
@@ -96,7 +100,7 @@ async function fetchJson(url, opts, timeoutMs) {
   } finally { clearTimeout(to); }
 }
 
-async function load() {
+async function load(isRetry) {
   if (!GAS_URL) {
     $('list').innerHTML = '<div class="empty">サーバー未設定です。<br>先にカメラアプリを ?gas=&lt;WebアプリURL&gt; 付きで一度開いてください。</div>';
     return;
@@ -104,7 +108,18 @@ async function load() {
   let j = null;
   try { j = await fetchJson(GAS_URL + '?na=list'); } catch (e) { }
   if (!j || !j.ok) {
-    $('list').innerHTML = '<div class="empty">一覧を取得できませんでした。<br>電波の良い場所で開き直してください。</div>';
+    // GAS初回応答は稀にこける(一過性)ので、1回だけ自動で再試行してから手動ボタンを出す
+    if (!isRetry) {
+      $('list').innerHTML = '<div class="empty">読込中…(再試行しています)</div>';
+      await new Promise(r => setTimeout(r, 1500));
+      return load(true);
+    }
+    $('list').innerHTML = '<div class="empty">一覧を取得できませんでした。' +
+      '<button class="retry-btn" id="reload">再試行</button></div>';
+    document.getElementById('reload').onclick = () => {
+      $('list').innerHTML = '<div class="empty">読込中…</div>';
+      load();
+    };
     return;
   }
   if (!j.items.length) {
